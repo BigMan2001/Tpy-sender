@@ -10,10 +10,19 @@
 //! This make sure to retry transient errors when making RPC calls, avoiding spreading retry-logic everywhere in business logic.
 //!
 //! ```rust
+//! use {
+//!     solana_client::{nonblocking::rpc_client::RpcClient, rpc_client::RpcClientConfig},
+//!     solana_commitment_config::CommitmentConfig,
+//!     solana_rpc_client::http_sender::HttpSender,
+//!     std::sync::Arc,
+//!     yellowstone_jet_tpu_client::rpc::solana_rpc_utils::RetryRpcSender,
+//! };
+//!
+//! let rpc = "http://127.0.0.1:8899".to_owned();
 //! let http_sender = HttpSender::new(rpc);
 //! let rpc_sender = RetryRpcSender::new(http_sender, Default::default());
 //!
-//! let rpc_client = Arc::new(rpc_client::RpcClient::new_sender(
+//! let rpc_client = Arc::new(RpcClient::new_sender(
 //!     rpc_sender,
 //!     RpcClientConfig {
 //!         commitment_config: CommitmentConfig::confirmed(),

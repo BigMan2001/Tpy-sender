@@ -2,8 +2,8 @@ use {
     crate::{
         config::{TpuPortKind, TpuSenderConfig},
         core::{
-            Nothing, StakeBasedEvictionStrategy, TpuSenderResponse, TpuSenderResponseCallback,
-            TpuSenderTxn,
+            DirectTpuConnection, Nothing, StakeBasedEvictionStrategy, TpuSenderResponse,
+            TpuSenderResponseCallback, TpuSenderTxn,
         },
         rpc::{
             schedule::{
@@ -13,7 +13,7 @@ use {
             stake::{RpcValidatorStakeInfoServiceConfig, rpc_validator_stake_info_service},
             tpu_info::{RpcClusterTpuQuicInfoServiceConfig, rpc_cluster_tpu_info_service},
         },
-        sender::{TpuSender, create_base_tpu_client},
+        sender::{TpuSender, TpuSenderTrySendError, create_base_tpu_client},
         slot::AtomicSlotTracker,
         yellowstone_grpc::{
             schedule::YellowstoneUpcomingLeader,
@@ -26,10 +26,12 @@ use {
     solana_client::{
         client_error::ClientError, nonblocking::rpc_client, rpc_client::RpcClientConfig,
     },
+    solana_clock::NUM_CONSECUTIVE_LEADER_SLOTS,
     solana_commitment_config::CommitmentConfig,
     solana_keypair::{Keypair, Signature},
     solana_pubkey::Pubkey,
     solana_rpc_client::http_sender::HttpSender,
+    solana_signature::SIGNATURE_BYTES,
     std::{
         collections::{BTreeSet, HashSet},
         fmt,
@@ -40,6 +42,7 @@ use {
 };
 
 pub const DEFAULT_TPU_SENDER_CHANNEL_CAPACITY: usize = 100_000;
+pub const FAST_SEND_MAX_LEADERS: usize = 2;
 
 ///
 /// Configuration object for [`YellowstoneTpuSender`].
@@ -126,7 +129,7 @@ pub enum CreateTpuSenderError {
 ///     Endpoints {
 ///         rpc: "https://my.rpc.endpoint".to_string(),
 ///         grpc: "https://my.grpc.endpoint".to_string(),
-///         grpc_x_token: Some("my-secret".to_string()),
+///         grpc_x_token: Some("token".to_string()),
 ///     }
 /// ).await.expect("yellowstone-tpu-sender");
 ///
@@ -164,7 +167,7 @@ pub enum CreateTpuSenderError {
 ///
 /// ```ignore
 ///
-/// let leader_to_block = vec![Pubkey::from_str("HEL1UZMZKAL2odpNBj2oCjffnFGaYwmbGmyewGv1e2TU").expect("from_str")];
+/// let leader_to_block = vec![Pubkey::new_unique()];
 /// sender.send_txn_with_blocklist(signature, bincoded_txn, Some(leader_to_block)).await;
 /// ```
 ///
@@ -193,8 +196,8 @@ pub enum CreateTpuSenderError {
 ///
 /// ```ignore
 /// let dests = vec![
-///     Pubkey::from_str("2nhGaJvR17TeytzJVajPfABHQcAwinKoCG8F69gRdQot").expect("from_str"),
-///     Pubkey::from_str("EdGevanA2MZsDpxDXK6b36FH7RCcTuDZZRcc6MEyE9hy").expect("from_str"),
+///     Pubkey::new_unique(),
+///     Pubkey::new_unique(),
 /// ];
 ///
 /// sender.send_txn_many_dest(signature, bincoded_txn, dests).await;
@@ -221,7 +224,7 @@ pub enum CreateTpuSenderError {
 ///     Endpoints {
 ///         rpc: "https://my.rpc.endpoint".to_string(),
 ///         grpc: "https://my.grpc.endpoint".to_string(),
-///         grpc_x_token: Some("my-secret".to_string()),
+///         grpc_x_token: Some("token".to_string()),
 ///     },
 ///     callback_tx,
 /// ).await.expect("yellowstone-tpu-sender");
@@ -239,6 +242,8 @@ pub enum CreateTpuSenderError {
 /// You can also implement your own callback by implementing the [`TpuSenderResponseCallback`] trait.
 ///
 /// ```rust
+/// use yellowstone_jet_tpu_client::core::{TpuSenderResponse, TpuSenderResponseCallback};
+///
 /// #[derive(Clone)]
 /// struct LoggingCallback;
 ///
@@ -298,6 +303,7 @@ pub struct YellowstoneTpuSender {
     leader_schedule: ManagedLeaderSchedule,
     leader_tpu_info: Arc<dyn crate::core::LeaderTpuInfoService + Send + Sync>,
     tpu_port_kind: TpuPortKind,
+    send_fanout_slots: u64,
 }
 
 ///
@@ -327,6 +333,30 @@ pub enum SendErrorKind {
     /// The channel between [`YellowstoneTpuSender`] and the actual tpu event-loop is closed.
     #[display("tpu sender disconnected")]
     Closed,
+    ///
+    /// The internal transaction queue is full.
+    #[display("tpu sender queue full")]
+    QueueFull,
+    ///
+    /// The serialized transaction bytes are malformed or do not include a signature.
+    #[display("invalid serialized transaction")]
+    InvalidWireTransaction,
+    ///
+    /// No leader was known for the selected fast fanout window.
+    #[display("no known leader in fanout window")]
+    NoKnownLeader,
+    ///
+    /// No TPU QUIC address was known for the selected fast fanout leaders.
+    #[display("no known TPU address for fanout leaders")]
+    NoKnownTpuAddress,
+    ///
+    /// No already-open direct TPU QUIC connection was available for the selected fanout leaders.
+    #[display("no ready direct TPU connection for fanout leaders")]
+    NoReadyDirectConnection,
+    ///
+    /// Direct TPU QUIC write failed for every ready fanout connection.
+    #[display("direct TPU write failed")]
+    DirectWriteFailed,
     ///
     /// The internal slot tracked closed, await [`NewYellowstoneTpuSender::related_objects_jh`] to get more information about the error.
     ///
@@ -399,6 +429,21 @@ impl Blocklist for &[Pubkey] {
     }
 }
 
+fn decode_shortvec_len(bytes: &[u8]) -> Option<(usize, usize)> {
+    let mut len = 0usize;
+    let mut shift = 0u32;
+
+    for (idx, byte) in bytes.iter().copied().take(3).enumerate() {
+        len |= ((byte & 0x7f) as usize).checked_shl(shift)?;
+        if byte & 0x80 == 0 {
+            return Some((len, idx + 1));
+        }
+        shift += 7;
+    }
+
+    None
+}
+
 ///
 /// A blocklist that is empty, equivalent of a pass-through filter.
 ///
@@ -453,6 +498,353 @@ impl Blocklist for ShieldBlockList<'_> {
 
 impl YellowstoneTpuSender {
     ///
+    /// Returns the latest slot observed by the internal Yellowstone slot tracker.
+    ///
+    pub fn current_slot(&self) -> Result<u64, crate::slot::PoisonError> {
+        self.atomic_slot_tracker.load()
+    }
+
+    fn fill_fast_fanout_leaders(
+        &self,
+        fanout_slots: u64,
+        leaders: &mut [Pubkey; FAST_SEND_MAX_LEADERS],
+    ) -> Result<usize, SendErrorKind> {
+        let current_slot = self
+            .atomic_slot_tracker
+            .load()
+            .map_err(|_| SendErrorKind::SlotTrackerDisconnected)?;
+        let end_slot = current_slot.saturating_add(fanout_slots.max(1));
+        let mut leader_slot = current_slot;
+        let mut len = 0;
+
+        while leader_slot < end_slot && len < FAST_SEND_MAX_LEADERS {
+            match self.leader_schedule.get_leader(leader_slot) {
+                Ok(Some(leader)) => {
+                    if !leaders[..len].contains(&leader) {
+                        leaders[len] = leader;
+                        len += 1;
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => return Err(SendErrorKind::ManagedLeaderScheduleDisconnected),
+            }
+
+            leader_slot = leader_slot.saturating_add(NUM_CONSECUTIVE_LEADER_SLOTS);
+        }
+
+        Ok(len)
+    }
+
+    fn first_signature_from_wire_transaction(wire_txn: &[u8]) -> Option<Signature> {
+        let (signature_count, signature_count_len) = decode_shortvec_len(wire_txn)?;
+        if signature_count == 0 {
+            return None;
+        }
+        let signature_end = signature_count_len.checked_add(SIGNATURE_BYTES)?;
+        if wire_txn.len() < signature_end {
+            return None;
+        }
+        Signature::try_from(&wire_txn[signature_count_len..signature_end]).ok()
+    }
+
+    ///
+    /// Fast-path send for already serialized transaction bytes.
+    ///
+    /// This path is non-async, uses a fixed leader buffer, always resolves the normal TPU
+    /// QUIC port, and submits directly to the internal sender queue without waiting for
+    /// channel capacity. The bytes must be the full serialized Solana transaction, not
+    /// only the message bytes.
+    ///
+    pub fn try_send_wire_transaction_fast(
+        &self,
+        sig: Signature,
+        wire_txn: Bytes,
+    ) -> Result<usize, SendError> {
+        self.try_send_wire_transaction_fanout_slots_fast(sig, wire_txn, self.send_fanout_slots)
+    }
+
+    ///
+    /// Fast-path send for full serialized transaction bytes with signature parsing.
+    ///
+    /// Returns the first transaction signature and the number of leader sends scheduled.
+    ///
+    pub fn try_send_wire_transaction_bytes_fast(
+        &self,
+        wire_txn: Bytes,
+    ) -> Result<(Signature, usize), SendError> {
+        let Some(sig) = Self::first_signature_from_wire_transaction(&wire_txn) else {
+            return Err(SendError {
+                kind: SendErrorKind::InvalidWireTransaction,
+                txn: wire_txn,
+            });
+        };
+        let sent_count = self.try_send_wire_transaction_fast(sig, wire_txn)?;
+        Ok((sig, sent_count))
+    }
+
+    ///
+    /// Direct fast-path send for full serialized transaction bytes.
+    ///
+    /// This bypasses the internal Tokio transaction channels. It only writes to
+    /// already-open QUIC connections installed by leader preconnect.
+    ///
+    pub async fn send_wire_transaction_direct_fast(
+        &self,
+        sig: Signature,
+        wire_txn: Bytes,
+    ) -> Result<usize, SendError> {
+        self.send_wire_transaction_fanout_slots_direct_fast(sig, wire_txn, self.send_fanout_slots)
+            .await
+    }
+
+    ///
+    /// Direct fast-path send with signature parsing from full serialized transaction bytes.
+    ///
+    pub async fn send_wire_transaction_bytes_direct_fast(
+        &self,
+        wire_txn: Bytes,
+    ) -> Result<(Signature, usize), SendError> {
+        let Some(sig) = Self::first_signature_from_wire_transaction(&wire_txn) else {
+            return Err(SendError {
+                kind: SendErrorKind::InvalidWireTransaction,
+                txn: wire_txn,
+            });
+        };
+        let sent_count = self
+            .send_wire_transaction_direct_fast(sig, wire_txn)
+            .await?;
+        Ok((sig, sent_count))
+    }
+
+    #[inline(always)]
+    async fn write_wire_transaction_direct_fast(
+        conn: DirectTpuConnection,
+        wire_txn: &[u8],
+    ) -> bool {
+        let Ok(mut uni) = conn.connection.open_uni().await else {
+            return false;
+        };
+
+        uni.write_all(wire_txn).await.is_ok()
+    }
+
+    ///
+    /// Direct fast-path send to unique leader TPU sockets in a slot fanout window.
+    ///
+    pub async fn send_wire_transaction_fanout_slots_direct_fast(
+        &self,
+        sig: Signature,
+        wire_txn: Bytes,
+        fanout_slots: u64,
+    ) -> Result<usize, SendError> {
+        let mut leaders = [Pubkey::default(); FAST_SEND_MAX_LEADERS];
+        let leader_count = self
+            .fill_fast_fanout_leaders(fanout_slots, &mut leaders)
+            .map_err(|kind| SendError {
+                kind,
+                txn: wire_txn.clone(),
+            })?;
+        if leader_count == 0 {
+            return Err(SendError {
+                kind: SendErrorKind::NoKnownLeader,
+                txn: wire_txn,
+            });
+        }
+
+        let _ = sig;
+        let mut sent_count = 0;
+        let mut missing_addr_count = 0;
+        let mut missing_connection_count = 0;
+        let mut direct_write_failed_count = 0;
+        let mut seen_addrs = [None; FAST_SEND_MAX_LEADERS];
+        let mut seen_addr_count = 0;
+
+        for leader in leaders[..leader_count].iter().copied() {
+            let Some(remote_peer_addr) = self
+                .leader_tpu_info
+                .get_quic_dest_addr(&leader, TpuPortKind::Normal)
+            else {
+                missing_addr_count += 1;
+                continue;
+            };
+            if seen_addrs[..seen_addr_count].contains(&Some(remote_peer_addr)) {
+                continue;
+            }
+            seen_addrs[seen_addr_count] = Some(remote_peer_addr);
+            seen_addr_count += 1;
+
+            let Some(conn) = self
+                .base_tpu_sender
+                .direct_connection(&leader, remote_peer_addr)
+            else {
+                missing_connection_count += 1;
+                continue;
+            };
+
+            if Self::write_wire_transaction_direct_fast(conn, wire_txn.as_ref()).await {
+                sent_count += 1;
+            } else {
+                direct_write_failed_count += 1;
+            }
+        }
+
+        if sent_count > 0 {
+            return Ok(sent_count);
+        }
+        if missing_addr_count > 0 && missing_connection_count == 0 && direct_write_failed_count == 0
+        {
+            return Err(SendError {
+                kind: SendErrorKind::NoKnownTpuAddress,
+                txn: wire_txn,
+            });
+        }
+        if missing_connection_count > 0 && direct_write_failed_count == 0 {
+            return Err(SendError {
+                kind: SendErrorKind::NoReadyDirectConnection,
+                txn: wire_txn,
+            });
+        }
+
+        Err(SendError {
+            kind: SendErrorKind::DirectWriteFailed,
+            txn: wire_txn,
+        })
+    }
+
+    ///
+    /// Fast-path send to unique leaders in a slot fanout window.
+    ///
+    pub fn try_send_wire_transaction_fanout_slots_fast(
+        &self,
+        sig: Signature,
+        wire_txn: Bytes,
+        fanout_slots: u64,
+    ) -> Result<usize, SendError> {
+        let mut leaders = [Pubkey::default(); FAST_SEND_MAX_LEADERS];
+        let leader_count = self
+            .fill_fast_fanout_leaders(fanout_slots, &mut leaders)
+            .map_err(|kind| SendError {
+                kind,
+                txn: wire_txn.clone(),
+            })?;
+        if leader_count == 0 {
+            return Err(SendError {
+                kind: SendErrorKind::NoKnownLeader,
+                txn: wire_txn,
+            });
+        }
+
+        let mut scheduled_count = 0;
+        let mut missing_addr_count = 0;
+        let mut seen_addrs = [None; FAST_SEND_MAX_LEADERS];
+        let mut seen_addr_count = 0;
+        for leader in leaders[..leader_count].iter().copied() {
+            let Some(remote_peer_addr) = self
+                .leader_tpu_info
+                .get_quic_dest_addr(&leader, TpuPortKind::Normal)
+            else {
+                missing_addr_count += 1;
+                continue;
+            };
+            if seen_addrs[..seen_addr_count].contains(&Some(remote_peer_addr)) {
+                continue;
+            }
+            seen_addrs[seen_addr_count] = Some(remote_peer_addr);
+            seen_addr_count += 1;
+
+            let tpu_txn = TpuSenderTxn::from_fast_bytes_with_addr(
+                sig,
+                leader,
+                wire_txn.clone(),
+                remote_peer_addr,
+            );
+            match self.base_tpu_sender.try_send_txn(tpu_txn) {
+                Ok(()) => scheduled_count += 1,
+                Err(TpuSenderTrySendError::Full(txn)) => {
+                    return Err(SendError {
+                        kind: SendErrorKind::QueueFull,
+                        txn: txn.wire,
+                    });
+                }
+                Err(TpuSenderTrySendError::Closed(txn)) => {
+                    return Err(SendError {
+                        kind: SendErrorKind::Closed,
+                        txn: txn.wire,
+                    });
+                }
+            }
+        }
+
+        if scheduled_count == 0 && missing_addr_count > 0 {
+            return Err(SendError {
+                kind: SendErrorKind::NoKnownTpuAddress,
+                txn: wire_txn,
+            });
+        }
+
+        Ok(scheduled_count)
+    }
+
+    ///
+    /// Returns unique leaders from the current slot through the requested fanout window.
+    ///
+    /// This mirrors Solana's TPU client style of sending to the current and upcoming
+    /// leaders over a slot window.
+    ///
+    pub fn upcoming_leaders_for_fanout_slots(
+        &self,
+        fanout_slots: u64,
+    ) -> Result<Vec<Pubkey>, SendErrorKind> {
+        self.upcoming_leaders_for_fanout_slots_with_blocklist::<NoBlocklist>(
+            fanout_slots,
+            Option::<&NoBlocklist>::None,
+        )
+        .map(|(leaders, _blocked_count)| leaders)
+    }
+
+    fn upcoming_leaders_for_fanout_slots_with_blocklist<B>(
+        &self,
+        fanout_slots: u64,
+        blocklist: Option<&B>,
+    ) -> Result<(Vec<Pubkey>, usize), SendErrorKind>
+    where
+        B: Blocklist,
+    {
+        let current_slot = self
+            .atomic_slot_tracker
+            .load()
+            .map_err(|_| SendErrorKind::SlotTrackerDisconnected)?;
+        let fanout_slots = fanout_slots.max(1);
+        let mut visited = HashSet::new();
+        let mut leaders = Vec::new();
+        let mut blocked_count = 0;
+
+        for leader_slot in (current_slot..current_slot + fanout_slots)
+            .step_by(NUM_CONSECUTIVE_LEADER_SLOTS as usize)
+        {
+            match self.leader_schedule.get_leader(leader_slot) {
+                Ok(Some(leader)) => {
+                    if let Some(blocklist) = blocklist {
+                        if blocklist.is_blocked(&leader) {
+                            blocked_count += 1;
+                            continue;
+                        }
+                    }
+                    if visited.insert(leader) {
+                        leaders.push(leader);
+                    }
+                }
+                Ok(None) => {
+                    tracing::warn!("unknown leader for slot {leader_slot}");
+                }
+                Err(_) => return Err(SendErrorKind::ManagedLeaderScheduleDisconnected),
+            }
+        }
+
+        Ok((leaders, blocked_count))
+    }
+
+    ///
     /// Sends a transaction to the specified destinations.
     ///
     /// # Arguments
@@ -500,6 +892,8 @@ impl YellowstoneTpuSender {
                 tx_sig: sig,
                 remote_peer: *dest,
                 wire: wire_txn.clone(),
+                remote_peer_addr: None,
+                flags: 0,
             };
             if self.base_tpu_sender.send_txn(tpu_txn).await.is_err() {
                 return Err(SendError {
@@ -512,7 +906,7 @@ impl YellowstoneTpuSender {
     }
 
     ///
-    /// Sends a transaction to the TPUs of the current leader and to the next leader iff near the slot boundary (2/4 slots).
+    /// Sends a transaction to the configured leader fanout.
     ///
     /// # Arguments
     ///
@@ -535,6 +929,30 @@ impl YellowstoneTpuSender {
         B: Blocklist,
     {
         let wire_txn = Bytes::from_owner(txn);
+        if self.send_fanout_slots > 0 {
+            match self.upcoming_leaders_for_fanout_slots_with_blocklist(
+                self.send_fanout_slots,
+                blocklist.as_ref(),
+            ) {
+                Ok((leaders, blocked_cnt)) => {
+                    return if leaders.is_empty() && blocked_cnt > 0 {
+                        Err(SendError {
+                            kind: SendErrorKind::RemotePeerBlocked,
+                            txn: wire_txn,
+                        })
+                    } else {
+                        self.send_txn_many_dest(sig, wire_txn, &leaders).await
+                    };
+                }
+                Err(err_kind) => {
+                    return Err(SendError {
+                        kind: err_kind,
+                        txn: wire_txn,
+                    });
+                }
+            }
+        }
+
         let current_slot = match self.atomic_slot_tracker.load() {
             Ok(slot) => slot,
             Err(_) => {
@@ -633,6 +1051,28 @@ impl YellowstoneTpuSender {
     {
         self.send_txn_with_blocklist(sig, txn, Some(NoBlocklist))
             .await
+    }
+
+    ///
+    /// Sends a transaction to unique leaders in the current fanout window.
+    ///
+    pub async fn send_txn_fanout_slots<T>(
+        &mut self,
+        sig: Signature,
+        txn: T,
+        fanout_slots: u64,
+    ) -> Result<(), SendError>
+    where
+        T: AsRef<[u8]> + Send + 'static,
+    {
+        let wire_txn = Bytes::from_owner(txn);
+        let leaders = self
+            .upcoming_leaders_for_fanout_slots(fanout_slots)
+            .map_err(|kind| SendError {
+                kind,
+                txn: wire_txn.clone(),
+            })?;
+        self.send_txn_many_dest(sig, wire_txn, &leaders).await
     }
 
     ///
@@ -783,6 +1223,7 @@ where
         managed_schedule: managed_leader_schedule.clone(),
     };
     let tpu_port_kind = config.tpu.tpu_port;
+    let send_fanout_slots = config.tpu.send_fanout_slots;
     let tpu_info_service: Arc<dyn crate::core::LeaderTpuInfoService + Send + Sync> =
         Arc::new(tpu_info_service);
     let base_tpu_sender = create_base_tpu_client(
@@ -806,6 +1247,7 @@ where
         leader_schedule: managed_leader_schedule,
         leader_tpu_info: Arc::clone(&tpu_info_service),
         tpu_port_kind,
+        send_fanout_slots,
     };
 
     let handles = vec![

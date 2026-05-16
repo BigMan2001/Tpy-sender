@@ -2,13 +2,15 @@ use {
     crate::{
         config::TpuSenderConfig,
         core::{
-            ConnectionEvictionStrategy, LeaderTpuInfoService, TpuSenderDriverSpawner,
-            TpuSenderIdentityUpdater, TpuSenderResponseCallback, TpuSenderSessionContext,
-            TpuSenderTxn, UpcomingLeaderPredictor, ValidatorStakeInfoService,
+            ConnectionEvictionStrategy, DirectTpuConnection, DirectTpuConnectionCache,
+            LeaderTpuInfoService, TpuSenderDriverSpawner, TpuSenderIdentityUpdater,
+            TpuSenderResponseCallback, TpuSenderSessionContext, TpuSenderTxn,
+            UpcomingLeaderPredictor, ValidatorStakeInfoService,
         },
     },
     solana_keypair::Keypair,
-    std::sync::Arc,
+    solana_pubkey::Pubkey,
+    std::{net::SocketAddr, sync::Arc},
     tokio::sync::{Mutex, mpsc},
 };
 
@@ -25,11 +27,20 @@ pub struct TpuSender {
     // We do this pre-cautionarily to avoid potential issues with miss-managed identity updates.
     identity_updated: Arc<Mutex<TpuSenderIdentityUpdater>>,
     txn_tx: mpsc::Sender<TpuSenderTxn>,
+    direct_connection_cache: DirectTpuConnectionCache,
 }
 
 #[derive(Debug, thiserror::Error)]
 #[error("disconnected")]
 pub struct TpuSenderError(TpuSenderTxn);
+
+#[derive(Debug, thiserror::Error)]
+pub enum TpuSenderTrySendError {
+    #[error("transaction queue full")]
+    Full(TpuSenderTxn),
+    #[error("disconnected")]
+    Closed(TpuSenderTxn),
+}
 
 impl TpuSender {
     ///
@@ -39,6 +50,32 @@ impl TpuSender {
         // I put &mut self here to indicate that the caller should not be sending txns concurrently from multiple tasks.
         // This is the be consistent with the rest of the API which uses &mut self for updating identity.
         self.txn_tx.send(txn).await.map_err(|e| TpuSenderError(e.0))
+    }
+
+    ///
+    /// Attempts to send a transaction to the TPU sender task without awaiting queue capacity.
+    ///
+    pub fn try_send_txn(&self, txn: TpuSenderTxn) -> Result<(), TpuSenderTrySendError> {
+        self.txn_tx.try_send(txn).map_err(|err| match err {
+            mpsc::error::TrySendError::Full(txn) => TpuSenderTrySendError::Full(txn),
+            mpsc::error::TrySendError::Closed(txn) => TpuSenderTrySendError::Closed(txn),
+        })
+    }
+
+    pub(crate) fn direct_connection(
+        &self,
+        remote_peer: &Pubkey,
+        expected_addr: SocketAddr,
+    ) -> Option<DirectTpuConnection> {
+        let guard = self
+            .direct_connection_cache
+            .lock()
+            .expect("direct connection cache mutex poisoned");
+        let conn = guard.get(remote_peer)?;
+        if conn.remote_peer_addr != expected_addr {
+            return None;
+        }
+        Some(conn.clone())
     }
 
     ///
@@ -107,9 +144,11 @@ where
         driver_tx_sink,
         driver_join_handle: _,
     } = session;
+    let direct_connection_cache = Arc::clone(&identity_updater.direct_connection_cache);
 
     TpuSender {
         identity_updated: Arc::new(Mutex::new(identity_updater)),
         txn_tx: driver_tx_sink,
+        direct_connection_cache,
     }
 }

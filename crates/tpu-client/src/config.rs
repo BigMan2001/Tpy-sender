@@ -15,11 +15,11 @@ pub enum TpuPortKind {
     ///
     /// Use the normal TPU port for QUIC connections.
     ///
+    #[default]
     Normal,
     ///
-    /// (Preferred) Use the forwards TPU port for QUIC connections.
+    /// Use the forwards TPU port for QUIC connections.
     ///
-    #[default]
     Forwards,
 }
 
@@ -114,7 +114,7 @@ pub struct TpuSenderConfig {
     pub connecting_timeout: Duration,
 
     ///
-    /// Which TPU port to use for QUIC connections, default is "forwards".
+    /// Which TPU port to use for QUIC connections, default is "normal".
     ///
     #[serde(default = "TpuSenderConfig::default_tpu_port_kind")]
     pub tpu_port: TpuPortKind,
@@ -185,6 +185,15 @@ pub struct TpuSenderConfig {
         alias = "connection_prediction_lookahead" /*LEGACY */
     )]
     pub leader_prediction_lookahead: Option<NonZeroUsize>,
+
+    ///
+    /// Number of upcoming slots to include when choosing leaders to send each transaction to.
+    ///
+    /// The default is 8, covering the current and next leader windows. Set to 0 to use the legacy
+    /// Yellowstone current/next-boundary fanout.
+    ///
+    #[serde(default = "TpuSenderConfig::default_send_fanout_slots")]
+    pub send_fanout_slots: u64,
 
     ///
     /// The TPU address rewrite map for QUIC connections.
@@ -289,8 +298,12 @@ impl TpuSenderConfig {
         Some(DEFAULT_LEADER_PREDICTION_LOOKAHEAD)
     }
 
+    pub const fn default_send_fanout_slots() -> u64 {
+        DEFAULT_SEND_FANOUT_SLOTS
+    }
+
     pub const fn default_tpu_port_kind() -> TpuPortKind {
-        TpuPortKind::Forwards
+        TpuPortKind::Normal
     }
 
     pub const fn default_port_range() -> PortRange {
@@ -307,17 +320,18 @@ impl TpuSenderConfig {
 /// At the same time, if we have too many endpoints, we might end up with too many event loops running concurrently.
 /// Talking with Anza, we should not open more than 5 endpoints to host QUIC connections.
 pub const DEFAULT_QUIC_DRIVER_ENDPOINT_COUNT: NonZeroUsize =
-    NonZeroUsize::new(5).expect("default endpoint count must be non-zero");
+    NonZeroUsize::new(1).expect("default endpoint count must be non-zero");
 pub const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(4);
 pub const DEFAULT_MAX_CONSECUTIVE_CONNECTION_ATTEMPT: usize = 3;
 pub const DEFAULT_PER_PEER_TRANSACTION_QUEUE_SIZE: usize = 10_000;
 pub const DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 pub const DEFAULT_MAX_LOCAL_BINDING_PORT_ATTEMPTS: usize = 3;
 pub const DEFAULT_LEADER_DURATION: Duration = Duration::from_secs(2); // 400ms * 4 rounded to seconds
-pub const DEFAULT_MAX_SEND_ATTEMPT: NonZeroUsize = NonZeroUsize::new(3).unwrap();
+pub const DEFAULT_MAX_SEND_ATTEMPT: NonZeroUsize = NonZeroUsize::new(1).unwrap();
 pub const DEFAULT_REMOTE_PEER_ADDR_WATCH_INTERVAL: Duration = Duration::from_secs(5);
 pub const DEFAULT_TX_SEND_TIMEOUT: Duration = Duration::from_secs(2);
-pub const DEFAULT_LEADER_PREDICTION_LOOKAHEAD: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+pub const DEFAULT_LEADER_PREDICTION_LOOKAHEAD: NonZeroUsize = NonZeroUsize::new(2).unwrap();
+pub const DEFAULT_SEND_FANOUT_SLOTS: u64 = 8;
 
 impl Default for TpuSenderConfig {
     fn default() -> Self {
@@ -335,6 +349,7 @@ impl Default for TpuSenderConfig {
             remote_peer_addr_watch_interval: DEFAULT_REMOTE_PEER_ADDR_WATCH_INTERVAL,
             send_timeout: DEFAULT_TX_SEND_TIMEOUT,
             leader_prediction_lookahead: Some(DEFAULT_LEADER_PREDICTION_LOOKAHEAD),
+            send_fanout_slots: DEFAULT_SEND_FANOUT_SLOTS,
             tpu_info_override: Vec::new(),
             orphan_connection_ttl: DEFAULT_UNUSED_CONNECTION_TTL,
             unsafe_allow_arbitrary_txn_size: false,

@@ -696,6 +696,7 @@ async fn it_should_evict_connection() {
 }
 
 #[tokio::test]
+#[cfg(feature = "intg-testing")]
 async fn it_should_retry_tx_failed_to_be_sent_due_to_connection_lost() {
     let rx_server_addr = generate_random_local_addr();
     let rx_server_identity = Keypair::new();

@@ -114,6 +114,8 @@ pub(crate) struct SentOk {
     pub e2e_time: Duration,
 }
 
+const TPU_SENDER_TXN_FLAG_FAST_UNSAFE: u8 = 1;
+
 ///
 /// Metadata about an inflight connection attempt to a remote peer.
 ///
@@ -200,6 +202,15 @@ struct TxWorkerMeta {
     remote_peer_identity: Pubkey,
 }
 
+#[derive(Clone)]
+pub(crate) struct DirectTpuConnection {
+    pub remote_peer_addr: SocketAddr,
+    pub connection: Arc<Connection>,
+    pub connection_version: u64,
+}
+
+pub(crate) type DirectTpuConnectionCache = Arc<StdMutex<HashMap<Pubkey, DirectTpuConnection>>>;
+
 ///
 /// Tokio-based driver for tpu sender.
 ///
@@ -213,6 +224,8 @@ pub(crate) struct TpuSenderDriver<CB> {
     /// Holds on-going remote peer transaction sender workers.
     ///
     tx_worker_handle_map: HashMap<Pubkey, TxWorkerSenderHandle>,
+
+    direct_connection_cache: DirectTpuConnectionCache,
 
     ///
     /// Maps active remote peer connection to their stake.
@@ -358,6 +371,7 @@ struct OrphanConnectionSet {
 }
 
 impl OrphanConnectionSet {
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.curr_len
     }
@@ -573,6 +587,9 @@ pub struct TpuSenderTxn {
     pub(crate) wire: Bytes,
     /// The pubkey of the remote peer to send the transaction to.
     pub remote_peer: Pubkey,
+    /// Optional already-resolved remote peer address for latency-sensitive callers.
+    pub(crate) remote_peer_addr: Option<SocketAddr>,
+    pub(crate) flags: u8,
 }
 
 impl TpuSenderTxn {
@@ -581,6 +598,38 @@ impl TpuSenderTxn {
             tx_sig,
             wire,
             remote_peer,
+            remote_peer_addr: None,
+            flags: 0,
+        }
+    }
+
+    pub fn from_bytes_with_addr(
+        tx_sig: Signature,
+        remote_peer: Pubkey,
+        wire: Bytes,
+        remote_peer_addr: SocketAddr,
+    ) -> Self {
+        Self {
+            tx_sig,
+            wire,
+            remote_peer,
+            remote_peer_addr: Some(remote_peer_addr),
+            flags: 0,
+        }
+    }
+
+    pub fn from_fast_bytes_with_addr(
+        tx_sig: Signature,
+        remote_peer: Pubkey,
+        wire: Bytes,
+        remote_peer_addr: SocketAddr,
+    ) -> Self {
+        Self {
+            tx_sig,
+            wire,
+            remote_peer,
+            remote_peer_addr: Some(remote_peer_addr),
+            flags: TPU_SENDER_TXN_FLAG_FAST_UNSAFE,
         }
     }
 
@@ -592,7 +641,14 @@ impl TpuSenderTxn {
             tx_sig,
             wire: Bytes::from_owner(wire),
             remote_peer,
+            remote_peer_addr: None,
+            flags: 0,
         }
+    }
+
+    #[inline(always)]
+    pub(crate) const fn is_fast_unsafe(&self) -> bool {
+        self.flags & TPU_SENDER_TXN_FLAG_FAST_UNSAFE != 0
     }
 }
 
@@ -887,6 +943,21 @@ impl<CB> QuicTxSenderWorker<CB>
 where
     CB: TpuSenderResponseCallback,
 {
+    #[inline(always)]
+    async fn send_tx_fast_unsafe(&mut self, tx: &[u8]) -> Result<(), SendTxError> {
+        let mut uni = self.connection.open_uni().await?;
+        uni.write_all(tx).await.map_err(|e| match e {
+            WriteError::Stopped(var_int) => SendTxError::StreamStopped(var_int),
+            WriteError::ConnectionLost(connection_error) => {
+                SendTxError::ConnectionError(connection_error)
+            }
+            WriteError::ClosedStream => SendTxError::StreamClosed,
+            WriteError::ZeroRttRejected => SendTxError::ZeroRttRejected,
+        })?;
+        self.txn_sent = self.txn_sent.saturating_add(1);
+        Ok(())
+    }
+
     async fn send_tx(&mut self, tx: &[u8]) -> Result<SentOk, SendTxError> {
         let t = Instant::now();
         let mut uni = self.connection.open_uni().await?;
@@ -908,6 +979,10 @@ where
         tx: TpuSenderTxn,
         attempt: usize,
     ) -> Option<TxSenderWorkerError> {
+        if tx.is_fast_unsafe() {
+            return self.process_tx_fast_unsafe(tx, attempt).await;
+        }
+
         let result = self.send_tx(tx.wire.as_ref()).await;
         let remote_addr = self.remote_peer_addr;
         let tx_sig = tx.tx_sig;
@@ -1002,6 +1077,50 @@ where
         }
     }
 
+    #[inline(always)]
+    async fn process_tx_fast_unsafe(
+        &mut self,
+        tx: TpuSenderTxn,
+        attempt: usize,
+    ) -> Option<TxSenderWorkerError> {
+        let result = self.send_tx_fast_unsafe(tx.wire.as_ref()).await;
+        let tx_sig = tx.tx_sig;
+        match result {
+            Ok(()) => {
+                if let Some(callback) = &self.output_tx {
+                    callback.call(TpuSenderResponse::TxSent(TxSent {
+                        remote_peer_identity: self.remote_peer,
+                        remote_peer_addr: self.remote_peer_addr,
+                        tx_sig,
+                    }));
+                }
+                None
+            }
+            Err(e) => {
+                if attempt >= self.max_tx_attempt.get() {
+                    if let Some(callback) = &self.output_tx {
+                        callback.call(TpuSenderResponse::TxFailed(TxFailed {
+                            remote_peer_identity: self.remote_peer,
+                            remote_peer_addr: self.remote_peer_addr,
+                            failure_reason: e.to_string(),
+                            tx_sig,
+                        }));
+                    }
+                } else {
+                    self.tx_queue.push_back((tx, attempt + 1));
+                }
+
+                match e {
+                    SendTxError::ConnectionError(connection_error) => {
+                        Some(TxSenderWorkerError::ConnectionLost(connection_error))
+                    }
+                    SendTxError::StreamStopped(_) | SendTxError::StreamClosed => None,
+                    SendTxError::ZeroRttRejected => Some(TxSenderWorkerError::ZeroRttRejected),
+                }
+            }
+        }
+    }
+
     async fn try_process_tx_in_queue(&mut self) -> Option<TxSenderWorkerError> {
         while let Some((tx, attempt)) = self.tx_queue.pop_front() {
             tracing::trace!(
@@ -1019,11 +1138,6 @@ where
 
     async fn run(mut self) -> TxSenderWorkerCompleted {
         let mut canceled = false;
-        let mut last_activity = Instant::now();
-        let mut burst_timer = Box::pin(tokio::time::sleep_until(
-            (last_activity + Duration::from_secs(10)).into(),
-        ));
-        const MAX_IDLE_DURATION: Duration = Duration::from_secs(10);
         let maybe_err = loop {
             tracing::trace!(
                 "worker {} tick loop -- queue size: {}",
@@ -1040,7 +1154,6 @@ where
                 maybe = self.incoming_rx.recv() => {
                     match maybe {
                         Some(tx) => {
-                            last_activity = Instant::now();
                             tracing::trace!("Received tx: {} for remote peer: {}", tx.tx_sig, self.remote_peer);
                             self.tx_queue.push_back((tx, 1));
                         }
@@ -1048,19 +1161,6 @@ where
                             tracing::debug!("Transaction sender inlet closed for remote peer: {:?}", self.remote_peer);
                             break None;
                         }
-                    }
-                }
-                _ = &mut burst_timer => {
-                    let idle_duration = Instant::now().duration_since(last_activity);
-                    tracing::debug!(
-                        "Transaction sender worker for remote peer: {:?} idle for {:?}, shutting down",
-                        self.remote_peer,
-                        idle_duration
-                    );
-                    if idle_duration >= MAX_IDLE_DURATION {
-                        break None;
-                    } else {
-                        burst_timer.as_mut().reset(( last_activity + Duration::from_secs(10) ).into());
                     }
                 }
                 err = self.connection.closed() => {
@@ -1627,6 +1727,16 @@ where
         attempt: usize,
         debug_source: SpawnSource,
     ) {
+        self.spawn_connecting_with_addr_hint(remote_peer_identity, None, attempt, debug_source);
+    }
+
+    fn spawn_connecting_with_addr_hint(
+        &mut self,
+        remote_peer_identity: Pubkey,
+        remote_peer_addr_hint: Option<SocketAddr>,
+        attempt: usize,
+        debug_source: SpawnSource,
+    ) {
         if self
             .connecting_remote_peers
             .contains_key(&remote_peer_identity)
@@ -1666,12 +1776,18 @@ where
         // Check if we already have a connection for the remote peer address
         // If not, check if there is already a connecting task for the same remote peer address
         // If not, spawn a new connecting task
-        let Some(remote_peer_addr) = self
-            .leader_tpu_info_service
-            .get_quic_dest_addr(&remote_peer_identity, self.config.tpu_port)
-        else {
-            self.unreachable_peer(remote_peer_identity);
-            return;
+        let remote_peer_addr = match remote_peer_addr_hint {
+            Some(remote_peer_addr) => remote_peer_addr,
+            None => {
+                let Some(remote_peer_addr) = self
+                    .leader_tpu_info_service
+                    .get_quic_dest_addr(&remote_peer_identity, self.config.tpu_port)
+                else {
+                    self.unreachable_peer(remote_peer_identity);
+                    return;
+                };
+                remote_peer_addr
+            }
         };
 
         if self
@@ -1972,7 +2088,7 @@ where
         let worker = QuicTxSenderWorker {
             remote_peer: remote_peer_identity,
             remote_peer_addr,
-            connection,
+            connection: Arc::clone(&connection),
             current_client_identity: self.identity.pubkey(),
             incoming_rx: rx,
             output_tx,
@@ -1998,6 +2114,17 @@ where
                 .insert(remote_peer_identity, handle)
                 .is_none()
         );
+        self.direct_connection_cache
+            .lock()
+            .expect("direct connection cache mutex poisoned")
+            .insert(
+                remote_peer_identity,
+                DirectTpuConnection {
+                    remote_peer_addr,
+                    connection: Arc::clone(&connection),
+                    connection_version,
+                },
+            );
         let task_id = ah.id();
         self.tx_worker_task_meta_map.insert(
             task_id,
@@ -2244,7 +2371,13 @@ where
     /// If not, the transaction is queued for later processing and a connection attempt is scheduled.
     ///
     fn accept_tx(&mut self, tx: TpuSenderTxn) {
+        if tx.is_fast_unsafe() {
+            self.accept_tx_fast_unsafe(tx);
+            return;
+        }
+
         let remote_peer_identity = tx.remote_peer;
+        let remote_peer_addr_hint = tx.remote_peer_addr;
         self.last_peer_activity
             .insert(remote_peer_identity, Instant::now());
         let tx_id = tx.tx_sig;
@@ -2326,8 +2459,57 @@ where
 
             // Check if we are not already connecting to this remote peer.
             // If the remote peer is already being connected, just queue the tx.
-            self.spawn_connecting(remote_peer_identity, 1, SpawnSource::NewTransaction);
+            self.spawn_connecting_with_addr_hint(
+                remote_peer_identity,
+                remote_peer_addr_hint,
+                1,
+                SpawnSource::NewTransaction,
+            );
         }
+    }
+
+    #[inline(always)]
+    fn accept_tx_fast_unsafe(&mut self, tx: TpuSenderTxn) {
+        let remote_peer_identity = tx.remote_peer;
+        let remote_peer_addr_hint = tx.remote_peer_addr;
+
+        if let Some(handle) = self.tx_worker_handle_map.get(&remote_peer_identity) {
+            match handle.sender.try_send(tx) {
+                Ok(()) => return,
+                Err(mpsc::error::TrySendError::Full(tx)) => {
+                    if let Some(callback) = self.response_outlet.as_ref() {
+                        callback.call(TpuSenderResponse::TxDrop(TxDrop {
+                            remote_peer_identity,
+                            drop_reason: TxDropReason::RateLimited,
+                            dropped_tx_vec: VecDeque::from([(tx, 1)]),
+                        }));
+                    }
+                    return;
+                }
+                Err(mpsc::error::TrySendError::Closed(tx)) => {
+                    self.last_peer_activity
+                        .insert(remote_peer_identity, Instant::now());
+                    self.tx_queues
+                        .entry(remote_peer_identity)
+                        .or_default()
+                        .push_back((tx, 1));
+                    return;
+                }
+            }
+        }
+
+        self.last_peer_activity
+            .insert(remote_peer_identity, Instant::now());
+        self.tx_queues
+            .entry(remote_peer_identity)
+            .or_default()
+            .push_back((tx, 1));
+        self.spawn_connecting_with_addr_hint(
+            remote_peer_identity,
+            remote_peer_addr_hint,
+            1,
+            SpawnSource::NewTransaction,
+        );
     }
 
     ///
@@ -2445,6 +2627,19 @@ where
                     .tx_worker_handle_map
                     .remove(&remote_peer_identity)
                     .expect("tx worker sender");
+                {
+                    let mut direct_cache = self
+                        .direct_connection_cache
+                        .lock()
+                        .expect("direct connection cache mutex poisoned");
+                    if direct_cache
+                        .get(&remote_peer_identity)
+                        .map(|conn| conn.connection_version == worker_tx.connection_version)
+                        .unwrap_or(false)
+                    {
+                        direct_cache.remove(&remote_peer_identity);
+                    }
+                }
 
                 if let Some(active_conn) = self.connection_map.get_mut(&worker_tx.remote_peer_addr)
                 {
@@ -2483,8 +2678,10 @@ where
                     tx_to_rescue.push_back((tx, attempt));
                 }
 
+                let had_worker_error = worker_completed.err.is_some();
                 let is_peer_unreachable = worker_completed
                     .err
+                    .as_ref()
                     .filter(|e| {
                         matches!(
                             e,
@@ -2529,6 +2726,10 @@ where
                         "Remote peer: {} has queued tx, wil reconnect",
                         remote_peer_identity
                     );
+                    self.last_peer_activity
+                        .insert(remote_peer_identity, Instant::now());
+                    self.spawn_connecting(remote_peer_identity, 1, SpawnSource::Rescue);
+                } else if had_worker_error && !worker_completed.canceled {
                     self.last_peer_activity
                         .insert(remote_peer_identity, Instant::now());
                     self.spawn_connecting(remote_peer_identity, 1, SpawnSource::Rescue);
@@ -2916,7 +3117,7 @@ where
         {
             prom::quic_set_identity(self.identity.pubkey());
         }
-        #[allow(unused_mut, dead_code)]
+        #[allow(unused_variables, unused_mut, dead_code)]
         let mut last_metric_update = Instant::now();
         let mut sleep_timer: Option<Pin<Box<Sleep>>> = None;
         loop {
@@ -2930,6 +3131,12 @@ where
             }
             self.try_predict_upcoming_leaders_if_necessary();
 
+            let mut prediction_timer = self.config.leader_prediction_lookahead.map(|_| {
+                let sleep_dur = self
+                    .next_leader_prediction_deadline
+                    .saturating_duration_since(Instant::now());
+                Box::pin(tokio::time::sleep(sleep_dur))
+            });
             let next_connection_expiration = self.next_orphan_connection_expiration();
             match next_connection_expiration {
                 Some(expiration_instant) => {
@@ -2961,6 +3168,9 @@ where
                 }
                 _ = async { sleep_timer.as_mut().unwrap().await }, if sleep_timer.is_some() => {
                     self.try_evict_orphan_connections();
+                }
+                _ = async { prediction_timer.as_mut().unwrap().await }, if prediction_timer.is_some() => {
+                    self.try_predict_upcoming_leaders_if_necessary();
                 }
                 // If cnc_rx returns None, we don't care as clients can safely drop cnc sender and the runtime should keep function.
                 Some(command) = self.cnc_rx.recv() => {
@@ -3303,6 +3513,7 @@ impl TpuSenderDriverSpawner {
 
         let (tx_inlet, tx_outlet) = mpsc::channel(self.driver_tx_channel_capacity);
         let (driver_cnc_tx, driver_cnc_rx) = mpsc::channel(10);
+        let direct_connection_cache = DirectTpuConnectionCache::default();
 
         let (certificate, private_key) = new_dummy_x509_certificate(&identity);
         let cert = Arc::new(QuicClientCertificate {
@@ -3340,6 +3551,7 @@ impl TpuSenderDriverSpawner {
         let driver = TpuSenderDriver {
             stake_info_map: Arc::clone(&self.stake_info_map),
             tx_worker_handle_map: Default::default(),
+            direct_connection_cache: Arc::clone(&direct_connection_cache),
             tx_worker_task_meta_map: Default::default(),
             tx_worker_set: Default::default(),
             active_staked_sorted_remote_peer: Default::default(),
@@ -3379,6 +3591,7 @@ impl TpuSenderDriverSpawner {
             driver_tx_sink: tx_inlet,
             identity_updater: TpuSenderIdentityUpdater {
                 cnc_tx: driver_cnc_tx,
+                direct_connection_cache,
             },
             driver_join_handle: jh,
         }
@@ -3393,6 +3606,7 @@ pub struct TpuSenderIdentityUpdater {
     /// Command-and-control channel to send command to the QUIC driver
     ///  
     cnc_tx: mpsc::Sender<DriverCommand>,
+    pub(crate) direct_connection_cache: DirectTpuConnectionCache,
 }
 
 ///
@@ -3509,7 +3723,10 @@ mod test {
     #[tokio::test]
     async fn test_update_identity_fut() {
         let (cnc_tx, mut cnc_rx) = mpsc::channel(10);
-        let mut updater = TpuSenderIdentityUpdater { cnc_tx };
+        let mut updater = TpuSenderIdentityUpdater {
+            cnc_tx,
+            direct_connection_cache: Default::default(),
+        };
 
         let jh = tokio::spawn(async move {
             let DriverCommand::UpdateIdenttiy(UpdateIdentityCommand {

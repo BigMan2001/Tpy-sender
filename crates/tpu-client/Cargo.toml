@@ -13,20 +13,8 @@ publish = true
 exclude = ["src/bin/*"]
 
 [[bin]]
-name = "test-managed-schedule"
-path = "src/bin/test-managed-schedule.rs"
-
-[[bin]]
-name = "test-tpu-info"
-path = "src/bin/test-tpu-info.rs"
-
-[[bin]]
-name = "test-tpu-send"
-path = "src/bin/test-tpu-send.rs"
-
-[[bin]]
-name = "test-slot-tracker"
-path = "src/bin/test-slot-tracker.rs"
+name = "test-tpu-send-each-slot"
+path = "src/bin/test-tpu-send-each-slot.rs"
 
 [features]
 default = ["yellowstone-grpc"]

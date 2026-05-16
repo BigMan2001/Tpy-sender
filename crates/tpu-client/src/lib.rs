@@ -32,7 +32,7 @@
 //!
 //! ## Example
 //!
-//! See [repository](https://github.com/rpcpool/yellowstone-jet/blob/main/crates/tpu-client/src/bin/test-tpu-send.rs) for more examples.
+//! See `crates/tpu-client/src/bin/test-tpu-send-each-slot.rs` for a live per-slot sender test.
 //!
 //! # feature-flag supports
 //!
