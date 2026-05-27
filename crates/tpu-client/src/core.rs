@@ -59,6 +59,7 @@ use {
     solana_tls_utils::{QuicClientCertificate, SkipServerVerification, new_dummy_x509_certificate},
     std::{
         collections::{BTreeMap, HashMap, HashSet, VecDeque},
+        mem::MaybeUninit,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         num::NonZeroUsize,
         pin::Pin,
@@ -232,17 +233,15 @@ impl DirectTpuConnection {
 }
 
 struct PreopenedUniStreamCache {
-    streams: StdMutex<VecDeque<SendStream>>,
+    streams: StdMutex<PreopenedUniStreamSlots>,
     refill_in_progress: AtomicBool,
-    target: usize,
 }
 
 impl PreopenedUniStreamCache {
-    fn new(target: usize) -> Self {
+    fn new() -> Self {
         Self {
-            streams: StdMutex::new(VecDeque::with_capacity(target)),
+            streams: StdMutex::new(PreopenedUniStreamSlots::new()),
             refill_in_progress: AtomicBool::new(false),
-            target,
         }
     }
 
@@ -251,18 +250,14 @@ impl PreopenedUniStreamCache {
         self.streams
             .lock()
             .expect("preopened stream cache mutex poisoned")
-            .pop_front()
+            .pop()
     }
 
     fn needs_replenish(&self) -> bool {
-        if self.target == 0 {
-            return false;
-        }
         self.streams
             .lock()
             .expect("preopened stream cache mutex poisoned")
-            .len()
-            < self.target
+            .needs_replenish()
     }
 
     fn push_if_needed(&self, stream: SendStream) -> bool {
@@ -270,11 +265,7 @@ impl PreopenedUniStreamCache {
             .streams
             .lock()
             .expect("preopened stream cache mutex poisoned");
-        if streams.len() >= self.target {
-            return false;
-        }
-        streams.push_back(stream);
-        true
+        streams.push(stream)
     }
 
     fn schedule_replenish(self: &Arc<Self>, connection: Arc<Connection>) {
@@ -302,6 +293,58 @@ impl PreopenedUniStreamCache {
                     }
                 }
                 Ok(Err(_)) | Err(_) => break,
+            }
+        }
+    }
+}
+
+struct PreopenedUniStreamSlots {
+    slots: [MaybeUninit<SendStream>; QUIC_PREOPENED_UNI_STREAM_CACHE_TARGET],
+    len: usize,
+}
+
+impl PreopenedUniStreamSlots {
+    fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| MaybeUninit::uninit()),
+            len: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn pop(&mut self) -> Option<SendStream> {
+        if self.len == 0 {
+            return None;
+        }
+
+        self.len -= 1;
+        // slots[..len] are initialized; after decrement, this slot is owned by the caller.
+        Some(unsafe { self.slots[self.len].assume_init_read() })
+    }
+
+    #[inline(always)]
+    fn push(&mut self, stream: SendStream) -> bool {
+        if !self.needs_replenish() {
+            return false;
+        }
+
+        self.slots[self.len].write(stream);
+        self.len += 1;
+        true
+    }
+
+    #[inline(always)]
+    fn needs_replenish(&self) -> bool {
+        self.len < self.slots.len()
+    }
+}
+
+impl Drop for PreopenedUniStreamSlots {
+    fn drop(&mut self) {
+        for slot in &mut self.slots[..self.len] {
+            // Only slots below len are initialized.
+            unsafe {
+                slot.assume_init_drop();
             }
         }
     }
@@ -2354,9 +2397,7 @@ where
                             remote_peer_addr: remote_peer_address,
                             conn: Arc::clone(&conn),
                             connection_version: self.next_connection_version(),
-                            preopened_uni_streams: Arc::new(PreopenedUniStreamCache::new(
-                                QUIC_PREOPENED_UNI_STREAM_CACHE_TARGET,
-                            )),
+                            preopened_uni_streams: Arc::new(PreopenedUniStreamCache::new()),
                             multiplexed_remote_peer_identity_with_stake: Default::default(),
                         };
                         self.connection_map
