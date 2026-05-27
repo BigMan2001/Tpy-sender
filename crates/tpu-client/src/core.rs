@@ -300,6 +300,7 @@ impl PreopenedUniStreamCache {
 
 struct PreopenedUniStreamSlots {
     slots: [MaybeUninit<SendStream>; QUIC_PREOPENED_UNI_STREAM_CACHE_TARGET],
+    head: usize,
     len: usize,
 }
 
@@ -307,6 +308,7 @@ impl PreopenedUniStreamSlots {
     fn new() -> Self {
         Self {
             slots: std::array::from_fn(|_| MaybeUninit::uninit()),
+            head: 0,
             len: 0,
         }
     }
@@ -317,9 +319,13 @@ impl PreopenedUniStreamSlots {
             return None;
         }
 
+        let stream = unsafe { self.slots[self.head].assume_init_read() };
+        self.head = Self::next_index(self.head);
         self.len -= 1;
-        // slots[..len] are initialized; after decrement, this slot is owned by the caller.
-        Some(unsafe { self.slots[self.len].assume_init_read() })
+        if self.len == 0 {
+            self.head = 0;
+        }
+        Some(stream)
     }
 
     #[inline(always)]
@@ -328,7 +334,8 @@ impl PreopenedUniStreamSlots {
             return false;
         }
 
-        self.slots[self.len].write(stream);
+        let tail = self.tail_index();
+        self.slots[tail].write(stream);
         self.len += 1;
         true
     }
@@ -337,14 +344,37 @@ impl PreopenedUniStreamSlots {
     fn needs_replenish(&self) -> bool {
         self.len < self.slots.len()
     }
+
+    #[inline(always)]
+    fn tail_index(&self) -> usize {
+        let mut tail = self.head + self.len;
+        if tail >= self.slots.len() {
+            tail -= self.slots.len();
+        }
+        tail
+    }
+
+    #[inline(always)]
+    fn next_index(index: usize) -> usize {
+        let next = index + 1;
+        if next == QUIC_PREOPENED_UNI_STREAM_CACHE_TARGET {
+            0
+        } else {
+            next
+        }
+    }
 }
 
 impl Drop for PreopenedUniStreamSlots {
     fn drop(&mut self) {
-        for slot in &mut self.slots[..self.len] {
-            // Only slots below len are initialized.
+        for offset in 0..self.len {
+            let mut index = self.head + offset;
+            if index >= self.slots.len() {
+                index -= self.slots.len();
+            }
+            // Only the active ring range is initialized.
             unsafe {
-                slot.assume_init_drop();
+                self.slots[index].assume_init_drop();
             }
         }
     }
