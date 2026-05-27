@@ -46,8 +46,8 @@ use {
     derive_more::Display,
     futures::task::AtomicWaker,
     quinn::{
-        ClientConfig, Connection, ConnectionError, Endpoint, IdleTimeout, TransportConfig, VarInt,
-        WriteError, crypto::rustls::QuicClientConfig,
+        ClientConfig, Connection, ConnectionError, Endpoint, IdleTimeout, SendStream,
+        TransportConfig, VarInt, WriteError, crypto::rustls::QuicClientConfig,
     },
     rustls::{NamedGroup, crypto::CryptoProvider},
     solana_clock::{DEFAULT_MS_PER_SLOT, NUM_CONSECUTIVE_LEADER_SLOTS},
@@ -62,7 +62,10 @@ use {
         net::{IpAddr, Ipv4Addr, SocketAddr},
         num::NonZeroUsize,
         pin::Pin,
-        sync::{Arc, Mutex as StdMutex, atomic::AtomicBool},
+        sync::{
+            Arc, Mutex as StdMutex,
+            atomic::{AtomicBool, Ordering},
+        },
         task::Poll,
         time::{Duration, Instant},
     },
@@ -73,7 +76,7 @@ use {
             mpsc::{self},
         },
         task::{self, Id, JoinError, JoinHandle, JoinSet},
-        time::{Sleep, interval},
+        time::{Sleep, interval, timeout},
     },
 };
 
@@ -97,6 +100,9 @@ pub const DEFAULT_LEADER_DURATION: Duration = Duration::from_secs(2); // 400ms *
 /// So apparently this is consistent across the network and solana client.
 /// putting 1s makes it the safest option.
 pub const QUIC_KEEP_ALIVE: Duration = Duration::from_secs(1); // seconds
+
+const QUIC_PREOPENED_UNI_STREAM_CACHE_TARGET: usize = 16;
+const QUIC_PREOPEN_UNI_STREAM_TIMEOUT: Duration = Duration::from_millis(10);
 
 // TODO see if its worth making this configurable
 #[cfg(feature = "prometheus")]
@@ -207,9 +213,99 @@ pub(crate) struct DirectTpuConnection {
     pub remote_peer_addr: SocketAddr,
     pub connection: Arc<Connection>,
     pub connection_version: u64,
+    preopened_uni_streams: Arc<PreopenedUniStreamCache>,
 }
 
 pub(crate) type DirectTpuConnectionCache = Arc<StdMutex<HashMap<Pubkey, DirectTpuConnection>>>;
+
+impl DirectTpuConnection {
+    #[inline(always)]
+    pub(crate) fn pop_preopened_uni_stream(&self) -> Option<SendStream> {
+        self.preopened_uni_streams.pop()
+    }
+
+    #[inline(always)]
+    pub(crate) fn schedule_preopen_uni_streams(&self) {
+        self.preopened_uni_streams
+            .schedule_replenish(Arc::clone(&self.connection));
+    }
+}
+
+struct PreopenedUniStreamCache {
+    streams: StdMutex<VecDeque<SendStream>>,
+    refill_in_progress: AtomicBool,
+    target: usize,
+}
+
+impl PreopenedUniStreamCache {
+    fn new(target: usize) -> Self {
+        Self {
+            streams: StdMutex::new(VecDeque::with_capacity(target)),
+            refill_in_progress: AtomicBool::new(false),
+            target,
+        }
+    }
+
+    #[inline(always)]
+    fn pop(&self) -> Option<SendStream> {
+        self.streams
+            .lock()
+            .expect("preopened stream cache mutex poisoned")
+            .pop_front()
+    }
+
+    fn needs_replenish(&self) -> bool {
+        if self.target == 0 {
+            return false;
+        }
+        self.streams
+            .lock()
+            .expect("preopened stream cache mutex poisoned")
+            .len()
+            < self.target
+    }
+
+    fn push_if_needed(&self, stream: SendStream) -> bool {
+        let mut streams = self
+            .streams
+            .lock()
+            .expect("preopened stream cache mutex poisoned");
+        if streams.len() >= self.target {
+            return false;
+        }
+        streams.push_back(stream);
+        true
+    }
+
+    fn schedule_replenish(self: &Arc<Self>, connection: Arc<Connection>) {
+        if !self.needs_replenish() {
+            return;
+        }
+
+        if self.refill_in_progress.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let cache = Arc::clone(self);
+        task::spawn(async move {
+            cache.replenish(connection).await;
+            cache.refill_in_progress.store(false, Ordering::Release);
+        });
+    }
+
+    async fn replenish(&self, connection: Arc<Connection>) {
+        while self.needs_replenish() {
+            match timeout(QUIC_PREOPEN_UNI_STREAM_TIMEOUT, connection.open_uni()).await {
+                Ok(Ok(stream)) => {
+                    if !self.push_if_needed(stream) {
+                        break;
+                    }
+                }
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+    }
+}
 
 ///
 /// Tokio-based driver for tpu sender.
@@ -531,6 +627,7 @@ pub struct ActiveConnection {
     remote_peer_addr: SocketAddr,
     conn: Arc<Connection>,
     connection_version: u64,
+    preopened_uni_streams: Arc<PreopenedUniStreamCache>,
     multiplexed_remote_peer_identity_with_stake: HashMap<Pubkey, u64>,
 }
 
@@ -914,6 +1011,7 @@ struct QuicTxSenderWorker<CB> {
     remote_peer: Pubkey,
     remote_peer_addr: SocketAddr,
     connection: Arc<Connection>,
+    preopened_uni_streams: Arc<PreopenedUniStreamCache>,
     /// The current client identity being used for the connection
     current_client_identity: Pubkey,
     incoming_rx: mpsc::Receiver<TpuSenderTxn>,
@@ -944,32 +1042,55 @@ where
     CB: TpuSenderResponseCallback,
 {
     #[inline(always)]
-    async fn send_tx_fast_unsafe(&mut self, tx: &[u8]) -> Result<(), SendTxError> {
-        let mut uni = self.connection.open_uni().await?;
-        uni.write_all(tx).await.map_err(|e| match e {
+    async fn open_uni_stream(&self) -> Result<SendStream, ConnectionError> {
+        if let Some(stream) = self.preopened_uni_streams.pop() {
+            return Ok(stream);
+        }
+
+        self.connection.open_uni().await
+    }
+
+    #[inline(always)]
+    fn schedule_preopen_uni_streams(&self) {
+        self.preopened_uni_streams
+            .schedule_replenish(Arc::clone(&self.connection));
+    }
+
+    #[inline(always)]
+    fn write_error_to_send_tx_error(e: WriteError) -> SendTxError {
+        match e {
             WriteError::Stopped(var_int) => SendTxError::StreamStopped(var_int),
             WriteError::ConnectionLost(connection_error) => {
                 SendTxError::ConnectionError(connection_error)
             }
             WriteError::ClosedStream => SendTxError::StreamClosed,
             WriteError::ZeroRttRejected => SendTxError::ZeroRttRejected,
-        })?;
-        self.txn_sent = self.txn_sent.saturating_add(1);
-        Ok(())
+        }
+    }
+
+    #[inline(always)]
+    async fn write_tx_to_uni_stream(&mut self, tx: &[u8]) -> Result<(), SendTxError> {
+        let mut uni = self.open_uni_stream().await?;
+        let result = uni
+            .write_all(tx)
+            .await
+            .map_err(Self::write_error_to_send_tx_error);
+        if result.is_ok() {
+            let _ = uni.finish();
+            self.txn_sent = self.txn_sent.saturating_add(1);
+        }
+        self.schedule_preopen_uni_streams();
+        result
+    }
+
+    #[inline(always)]
+    async fn send_tx_fast_unsafe(&mut self, tx: &[u8]) -> Result<(), SendTxError> {
+        self.write_tx_to_uni_stream(tx).await
     }
 
     async fn send_tx(&mut self, tx: &[u8]) -> Result<SentOk, SendTxError> {
         let t = Instant::now();
-        let mut uni = self.connection.open_uni().await?;
-        uni.write_all(tx).await.map_err(|e| match e {
-            WriteError::Stopped(var_int) => SendTxError::StreamStopped(var_int),
-            WriteError::ConnectionLost(connection_error) => {
-                SendTxError::ConnectionError(connection_error)
-            }
-            WriteError::ClosedStream => SendTxError::StreamClosed,
-            WriteError::ZeroRttRejected => SendTxError::ZeroRttRejected,
-        })?;
-        self.txn_sent = self.txn_sent.saturating_add(1);
+        self.write_tx_to_uni_stream(tx).await?;
         let e2e_time = t.elapsed();
         let ok = SentOk { e2e_time };
         Ok(ok)
@@ -2072,10 +2193,14 @@ where
     fn install_worker(&mut self, remote_peer_identity: Pubkey, remote_peer_addr: SocketAddr) {
         let (tx, rx) = mpsc::channel(self.config.transaction_sender_worker_channel_capacity);
 
-        let (connection, connection_version) = match self.connection_map.get(&remote_peer_addr) {
+        let (connection, connection_version, preopened_uni_streams) = match self
+            .connection_map
+            .get(&remote_peer_addr)
+        {
             Some(active_conn) => (
                 Arc::clone(&active_conn.conn),
                 active_conn.connection_version,
+                Arc::clone(&active_conn.preopened_uni_streams),
             ),
             None => {
                 panic!("Active connection must exist for remote peer address: {remote_peer_addr}");
@@ -2089,6 +2214,7 @@ where
             remote_peer: remote_peer_identity,
             remote_peer_addr,
             connection: Arc::clone(&connection),
+            preopened_uni_streams: Arc::clone(&preopened_uni_streams),
             current_client_identity: self.identity.pubkey(),
             incoming_rx: rx,
             output_tx,
@@ -2123,8 +2249,10 @@ where
                     remote_peer_addr,
                     connection: Arc::clone(&connection),
                     connection_version,
+                    preopened_uni_streams: Arc::clone(&preopened_uni_streams),
                 },
             );
+        preopened_uni_streams.schedule_replenish(Arc::clone(&connection));
         let task_id = ah.id();
         self.tx_worker_task_meta_map.insert(
             task_id,
@@ -2226,6 +2354,9 @@ where
                             remote_peer_addr: remote_peer_address,
                             conn: Arc::clone(&conn),
                             connection_version: self.next_connection_version(),
+                            preopened_uni_streams: Arc::new(PreopenedUniStreamCache::new(
+                                QUIC_PREOPENED_UNI_STREAM_CACHE_TARGET,
+                            )),
                             multiplexed_remote_peer_identity_with_stake: Default::default(),
                         };
                         self.connection_map

@@ -621,11 +621,23 @@ impl YellowstoneTpuSender {
         conn: DirectTpuConnection,
         wire_txn: &[u8],
     ) -> bool {
-        let Ok(mut uni) = conn.connection.open_uni().await else {
-            return false;
+        let mut uni = match conn.pop_preopened_uni_stream() {
+            Some(uni) => uni,
+            None => {
+                let Ok(uni) = conn.connection.open_uni().await else {
+                    return false;
+                };
+                uni
+            }
         };
 
-        uni.write_all(wire_txn).await.is_ok()
+        let ok = uni.write_all(wire_txn).await.is_ok();
+        if ok {
+            let _ = uni.finish();
+        }
+
+        conn.schedule_preopen_uni_streams();
+        ok
     }
 
     ///

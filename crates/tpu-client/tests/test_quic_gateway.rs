@@ -1067,6 +1067,123 @@ async fn it_should_preemptively_connect_to_upcoming_leader_using_leader_predicti
 }
 
 #[tokio::test]
+async fn preconnected_fast_sender_should_land_100_transactions() {
+    let rx_server_addr = generate_random_local_addr();
+    let rx_server_identity = Keypair::new();
+    let gateway_kp = Keypair::new();
+    let stake_info_map = MockStakeInfoMap::constant([(rx_server_identity.pubkey(), 1000)]);
+    let fake_tpu_info_service =
+        FakeLeaderTpuInfoService::from_iter([(rx_server_identity.pubkey(), rx_server_addr)]);
+
+    let (conn_established_tx, mut conn_established_rx) = mpsc::channel(10);
+    let (mut client_rx, _rx_server_handle) = MockedRemoteValidator::spawn(
+        rx_server_identity.insecure_clone(),
+        rx_server_addr,
+        MockValidatorNotifiers {
+            connection_established_notify: Some(conn_established_tx),
+            ..Default::default()
+        },
+    );
+
+    struct SingleLeaderPredictor {
+        leader: Pubkey,
+    }
+
+    impl UpcomingLeaderPredictor for SingleLeaderPredictor {
+        fn try_predict_next_n_leaders(&self, n: usize) -> Vec<Pubkey> {
+            if n == 0 {
+                Vec::new()
+            } else {
+                vec![self.leader]
+            }
+        }
+    }
+
+    let gateway_spawner = TpuSenderDriverSpawner {
+        stake_info_map: Arc::new(stake_info_map),
+        leader_tpu_info_service: Arc::new(fake_tpu_info_service),
+        driver_tx_channel_capacity: 200,
+    };
+    let (callback_tx, mut callback_rx) = mpsc::unbounded_channel();
+    let TpuSenderSessionContext {
+        identity_updater: _,
+        driver_tx_sink: transaction_sink,
+        driver_join_handle: _,
+    } = gateway_spawner.spawn(
+        gateway_kp.insecure_clone(),
+        TpuSenderConfig {
+            leader_prediction_lookahead: Some(NonZeroUsize::new(1).unwrap()),
+            ..Default::default()
+        },
+        Arc::new(StakeBasedEvictionStrategy::default()),
+        Arc::new(SingleLeaderPredictor {
+            leader: rx_server_identity.pubkey(),
+        }),
+        Some(callback_tx),
+    );
+
+    let established = tokio::time::timeout(Duration::from_secs(2), conn_established_rx.recv())
+        .await
+        .expect("connection established timeout")
+        .expect("connection established");
+    assert_eq!(established.remote_pubkey, gateway_kp.pubkey());
+
+    const TX_COUNT: usize = 100;
+    let mut expected_payloads = HashSet::with_capacity(TX_COUNT);
+    let mut expected_signatures = HashSet::with_capacity(TX_COUNT);
+    for i in 0..TX_COUNT {
+        let tx_sig = Signature::new_unique();
+        let payload = format!("fast-tx-{i}");
+        expected_payloads.insert(payload.clone());
+        expected_signatures.insert(tx_sig);
+        let txn = TpuSenderTxn::from_fast_bytes_with_addr(
+            tx_sig,
+            rx_server_identity.pubkey(),
+            Bytes::from(payload.into_bytes()),
+            rx_server_addr,
+        );
+        transaction_sink.send(txn).await.expect("send tx");
+    }
+
+    let mut landed_payloads = HashSet::with_capacity(TX_COUNT);
+    let mut connection_ids = HashSet::new();
+    for _ in 0..TX_COUNT {
+        let spy_request = tokio::time::timeout(Duration::from_secs(5), client_rx.recv())
+            .await
+            .expect("receive transaction timeout")
+            .expect("receive transaction");
+        assert_eq!(spy_request.from, gateway_kp.pubkey());
+        connection_ids.insert(spy_request.connection_id);
+        landed_payloads.insert(String::from_utf8(spy_request.data).expect("utf8"));
+    }
+
+    let mut sent_signatures = HashSet::with_capacity(TX_COUNT);
+    for _ in 0..TX_COUNT {
+        let TpuSenderResponse::TxSent(actual_resp) =
+            tokio::time::timeout(Duration::from_secs(5), callback_rx.recv())
+                .await
+                .expect("receive callback timeout")
+                .expect("receive callback")
+        else {
+            panic!("Expected TpuSenderResponse::TxSent, got something else");
+        };
+        assert_eq!(
+            actual_resp.remote_peer_identity,
+            rx_server_identity.pubkey()
+        );
+        sent_signatures.insert(actual_resp.tx_sig);
+    }
+
+    assert_eq!(landed_payloads, expected_payloads);
+    assert_eq!(sent_signatures, expected_signatures);
+    assert_eq!(
+        connection_ids.len(),
+        1,
+        "all 100 tx should reuse one QUIC connection"
+    );
+}
+
+#[tokio::test]
 async fn it_should_support_multiplexed_connection() {
     // Multiple remote peer validators may share the same socket address.
     // This test ensures that the gateway can handle such a scenario by
