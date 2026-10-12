@@ -17,6 +17,8 @@ use {
 
 pub const DEFAULT_AUTO_LEADER_SCHEDULE_CHECK_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(30);
+pub const DEFAULT_MISSING_NEXT_SCHEDULE_RETRY_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
 
 ///
 /// A compact representation of the leader schedule for an epoch,
@@ -307,6 +309,14 @@ async fn auto_leader_schedule_loop(
         .read()
         .map(|schedules| schedules.double_buffer[0].epoch())
         .unwrap_or_default();
+    // Startup already attempted to fetch the next epoch. If it is not
+    // published yet, do not hammer getLeaderSchedule on every cheap epoch
+    // check. A newly observed epoch gets one immediate prefetch attempt for
+    // its successor; otherwise a missing next schedule is retried at this
+    // bounded cadence.
+    let mut next_retry_epoch = last_observed_epoch.saturating_add(1);
+    let mut next_retry_not_before =
+        tokio::time::Instant::now() + DEFAULT_MISSING_NEXT_SCHEDULE_RETRY_INTERVAL;
 
     loop {
         tokio::select! {
@@ -328,7 +338,8 @@ async fn auto_leader_schedule_loop(
             }
         };
 
-        if epoch != last_observed_epoch {
+        let epoch_changed = epoch != last_observed_epoch;
+        if epoch_changed {
             tracing::info!(
                 "AutoLeaderSchedule: detected epoch change {} -> {}",
                 last_observed_epoch,
@@ -355,6 +366,16 @@ async fn auto_leader_schedule_loop(
         // but only download the large complete schedule response for a missing
         // epoch. This makes transition recovery fast without continuously
         // transferring two full schedules.
+        if next_retry_epoch != next_epoch {
+            next_retry_epoch = next_epoch;
+            next_retry_not_before = tokio::time::Instant::now();
+        }
+        let fetch_next = needs_next && tokio::time::Instant::now() >= next_retry_not_before;
+        if fetch_next {
+            next_retry_not_before =
+                tokio::time::Instant::now() + DEFAULT_MISSING_NEXT_SCHEDULE_RETRY_INTERVAL;
+        }
+
         let (current_result, next_result) = join(
             async {
                 if needs_current {
@@ -368,7 +389,7 @@ async fn auto_leader_schedule_loop(
                 }
             },
             async {
-                if needs_next {
+                if fetch_next {
                     Some(
                         rpc_client
                             .get_unnested_leader_schedule(Some(next_epoch_first_slot))
@@ -380,6 +401,7 @@ async fn auto_leader_schedule_loop(
             },
         )
         .await;
+        let refresh_attempted = current_result.is_some() || next_result.is_some();
 
         let current_schedule = match current_result {
             Some(Ok(schedule)) => schedule,
@@ -405,6 +427,10 @@ async fn auto_leader_schedule_loop(
             }
             None => None,
         };
+
+        if !epoch_changed && !refresh_attempted {
+            continue;
+        }
 
         let Ok(mut schedules) = shared.write() else {
             tracing::error!("[TPU_SCHEDULE][REFRESH_FAILED] schedule lock poisoned");

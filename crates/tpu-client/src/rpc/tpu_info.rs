@@ -183,8 +183,11 @@ async fn cluster_info_refresh_loop(
     config: RpcClusterTpuQuicInfoServiceConfig,
     cancellation_token: CancellationToken,
 ) {
-    let mut interval = tokio::time::interval(config.refresh_interval);
-    let last_snapshot = shared.read().expect("read").clone();
+    // `tokio::time::interval` ticks immediately. Start at the first real
+    // deadline instead, because bootstrap already fetched getClusterNodes and
+    // an immediate second full response is pure duplicate work.
+    let first_refresh = tokio::time::Instant::now() + config.refresh_interval;
+    let mut interval = tokio::time::interval_at(first_refresh, config.refresh_interval);
     let mut consecutive_fetch_errors = 0;
     loop {
         tokio::select! {
@@ -202,7 +205,14 @@ async fn cluster_info_refresh_loop(
             Ok(nodes) => {
                 // Update shared state
                 consecutive_fetch_errors = 0;
-                let diff = detect_tpu_contact_info_diff(&last_snapshot, &nodes);
+                // Always diff against the latest installed topology. Diffing
+                // against the startup snapshot would replay the same patch on
+                // every refresh and could also keep removed nodes around after
+                // subsequent topology changes.
+                let diff = {
+                    let current = shared.read().expect("read");
+                    detect_tpu_contact_info_diff(&current, &nodes)
+                };
 
                 if !diff.is_empty() {
                     tracing::trace!("Updating cluster nodes with {} changes.", diff.len());
