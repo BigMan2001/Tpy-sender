@@ -11,7 +11,10 @@ use {
     solana_keypair::Keypair,
     solana_pubkey::Pubkey,
     std::{net::SocketAddr, sync::Arc},
-    tokio::sync::{Mutex, mpsc},
+    tokio::{
+        sync::{Mutex, mpsc},
+        task::JoinHandle,
+    },
 };
 
 ///
@@ -28,6 +31,17 @@ pub struct TpuSender {
     identity_updated: Arc<Mutex<TpuSenderIdentityUpdater>>,
     txn_tx: mpsc::Sender<TpuSenderTxn>,
     direct_connection_cache: DirectTpuConnectionCache,
+    _driver_guard: Arc<TpuSenderDriverGuard>,
+}
+
+struct TpuSenderDriverGuard {
+    driver_join_handle: JoinHandle<()>,
+}
+
+impl Drop for TpuSenderDriverGuard {
+    fn drop(&mut self) {
+        self.driver_join_handle.abort();
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -46,6 +60,7 @@ impl TpuSender {
     ///
     /// Sends a transaction to the TPU sender task.
     ///
+    #[allow(clippy::result_large_err)]
     pub async fn send_txn(&mut self, txn: TpuSenderTxn) -> Result<(), TpuSenderError> {
         // I put &mut self here to indicate that the caller should not be sending txns concurrently from multiple tasks.
         // This is the be consistent with the rest of the API which uses &mut self for updating identity.
@@ -55,6 +70,7 @@ impl TpuSender {
     ///
     /// Attempts to send a transaction to the TPU sender task without awaiting queue capacity.
     ///
+    #[allow(clippy::result_large_err)]
     pub fn try_send_txn(&self, txn: TpuSenderTxn) -> Result<(), TpuSenderTrySendError> {
         self.txn_tx.try_send(txn).map_err(|err| match err {
             mpsc::error::TrySendError::Full(txn) => TpuSenderTrySendError::Full(txn),
@@ -142,7 +158,7 @@ where
     let TpuSenderSessionContext {
         identity_updater,
         driver_tx_sink,
-        driver_join_handle: _,
+        driver_join_handle,
     } = session;
     let direct_connection_cache = Arc::clone(&identity_updater.direct_connection_cache);
 
@@ -150,5 +166,6 @@ where
         identity_updated: Arc::new(Mutex::new(identity_updater)),
         txn_tx: driver_tx_sink,
         direct_connection_cache,
+        _driver_guard: Arc::new(TpuSenderDriverGuard { driver_join_handle }),
     }
 }

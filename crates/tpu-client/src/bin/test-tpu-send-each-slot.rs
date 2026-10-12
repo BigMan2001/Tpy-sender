@@ -188,7 +188,7 @@ fn spawn_status_batch(
                     let mut unconfirmed = 0_u64;
                     let mut missing = 0_u64;
 
-                    for (entry, maybe_status) in batch.iter().zip(statuses.value.into_iter()) {
+                    for (entry, maybe_status) in batch.iter().zip(statuses.value) {
                         match maybe_status {
                             Some(status)
                                 if status.satisfies_commitment(CommitmentConfig::confirmed()) =>
@@ -329,10 +329,10 @@ fn split_rpc_urls(values: &[String]) -> Vec<String> {
 
 fn status_rpc_urls(configured_urls: &[String], fallback_url: &str) -> Vec<String> {
     let mut urls = split_rpc_urls(configured_urls);
-    if urls.is_empty() {
-        if let Ok(env_urls) = env::var("STATUS_RPC_ENDPOINTS") {
-            urls = split_rpc_urls(&[env_urls]);
-        }
+    if urls.is_empty()
+        && let Ok(env_urls) = env::var("STATUS_RPC_ENDPOINTS")
+    {
+        urls = split_rpc_urls(&[env_urls]);
     }
     if urls.is_empty() {
         urls.push(fallback_url.to_owned());
@@ -514,11 +514,11 @@ async fn main() {
         }
 
         for slot in (last_slot + 1)..=current_slot {
-            if let Some(max_slots) = args.slots {
-                if sent_count >= max_slots {
-                    tracing::info!("sent requested {max_slots} slots, stopping");
-                    break 'send_loop;
-                }
+            if let Some(max_slots) = args.slots
+                && sent_count >= max_slots
+            {
+                tracing::info!("sent requested {max_slots} slots, stopping");
+                break 'send_loop;
             }
 
             let latest_blockhash = rpc_client

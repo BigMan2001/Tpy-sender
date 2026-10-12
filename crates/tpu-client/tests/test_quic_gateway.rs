@@ -166,8 +166,8 @@ impl MockedRemoteValidator {
                 let new_connection_id = connection_id;
                 let conn = connecting.await.expect("quinn connection");
                 connection_id += 1;
-                let remote_key = solana_streamer::nonblocking::quic::get_remote_pubkey(&conn)
-                    .expect("get remote pubkey");
+                let remote_key =
+                    solana_tls_utils::get_remote_pubkey(&conn).expect("get remote pubkey");
                 if let Some(tx) = notifiers.connection_established_notify.as_ref() {
                     let _ = tx
                         .send(MockConnectionEstablished {

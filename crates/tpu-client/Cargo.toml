@@ -15,6 +15,7 @@ exclude = ["src/bin/*"]
 [[bin]]
 name = "test-tpu-send-each-slot"
 path = "src/bin/test-tpu-send-each-slot.rs"
+required-features = ["examples"]
 
 [features]
 default = ["yellowstone-grpc"]
@@ -34,7 +35,6 @@ yellowstone-grpc = [
     "dep:yellowstone-grpc-client",
     "dep:yellowstone-grpc-proto",
 ]
-shield = ["dep:yellowstone-shield-store"]
 intg-testing = []
 
 [dependencies]
@@ -90,6 +90,7 @@ solana-epoch-info = { workspace = true }
 solana-hash = { workspace = true, optional = true }
 solana-instruction = { workspace = true }
 solana-keypair = { workspace = true }
+solana-leader-schedule = { workspace = true }
 solana-message = { workspace = true }
 solana-packet = { workspace = true }
 solana-pubkey = { workspace = true }
@@ -101,4 +102,6 @@ solana-transaction-error = { workspace = true }
 # Yellowstone
 yellowstone-grpc-client = { workspace = true, optional = true }
 yellowstone-grpc-proto = { workspace = true, optional = true }
-yellowstone-shield-store = { workspace = true, optional = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true, features = ["ansi", "env-filter", "json"] }

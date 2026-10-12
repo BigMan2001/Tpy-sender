@@ -328,6 +328,7 @@ pub mod tests {
             node_pubkey: validator_pubkey.to_string(),
             activated_stake,
             commission: 0,
+            inflation_rewards_commission_bps: Some(0),
             epoch_vote_account: true,
             epoch_credits: vec![],
             last_vote: 1,

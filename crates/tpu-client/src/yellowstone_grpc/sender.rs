@@ -7,7 +7,8 @@ use {
         },
         rpc::{
             schedule::{
-                ManagedLeaderSchedule, ManagedLeaderScheduleConfig, spawn_managed_leader_schedule,
+                ManagedLeaderSchedule, ManagedLeaderScheduleConfig, ManagedLeaderScheduleError,
+                spawn_managed_leader_schedule,
             },
             solana_rpc_utils::RetryRpcSender,
             stake::{RpcValidatorStakeInfoServiceConfig, rpc_validator_stake_info_service},
@@ -26,9 +27,9 @@ use {
     solana_client::{
         client_error::ClientError, nonblocking::rpc_client, rpc_client::RpcClientConfig,
     },
-    solana_clock::NUM_CONSECUTIVE_LEADER_SLOTS,
     solana_commitment_config::CommitmentConfig,
     solana_keypair::{Keypair, Signature},
+    solana_leader_schedule::NUM_CONSECUTIVE_LEADER_SLOTS,
     solana_pubkey::Pubkey,
     solana_rpc_client::http_sender::HttpSender,
     solana_signature::SIGNATURE_BYTES,
@@ -36,9 +37,13 @@ use {
         collections::{BTreeSet, HashSet},
         fmt,
         sync::Arc,
+        time::Duration,
     },
     tokio::sync::mpsc::UnboundedSender,
-    yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcBuilder, GeyserGrpcClient},
+    yellowstone_grpc_client::{
+        Backoff, ClientTlsConfig, GeyserGrpcBuilder, GeyserGrpcClient, ReconnectConfig,
+        ReconnectionPolicy,
+    },
 };
 
 pub const DEFAULT_TPU_SENDER_CHANNEL_CAPACITY: usize = 100_000;
@@ -103,6 +108,11 @@ pub enum CreateTpuSenderError {
     ///
     #[error("geyser client returned empty slot tracker stream")]
     GeyserSubscriptionEnded,
+    ///
+    /// Error while initializing the complete current/next leader schedule.
+    ///
+    #[error(transparent)]
+    LeaderScheduleError(#[from] ManagedLeaderScheduleError),
 }
 
 ///
@@ -169,27 +179,6 @@ pub enum CreateTpuSenderError {
 ///
 /// let leader_to_block = vec![Pubkey::new_unique()];
 /// sender.send_txn_with_blocklist(signature, bincoded_txn, Some(leader_to_block)).await;
-/// ```
-///
-/// If you are using [Yellowstone Shield crate](https://crates.io/crates/yellowstone-shield-store),
-/// you can enable `shield` feature flag and use Shield policies as blocklist:
-///
-/// ```ignore
-///
-/// let policy_store: yellowstone_shield_store::PolicyStore = <...>;
-/// let policies = vec![
-///     Pubkey::from_str("PolicyPubkey1...").expect("from_str"),
-///     Pubkey::from_str("PolicyPubkey2...").expect("from_str"),
-/// ];
-///
-/// let shield_blocklist = ShieldBlockList {
-///     policy_store: &policy_store,
-///     shield_policy_addresses: &policies,
-///     default_return_value: true, // allow sending when in doubt
-/// };
-///
-/// sender.send_txn_with_shield_policies(signature, bincoded_txn, shield_blocklist).await;
-///
 /// ```
 ///
 /// # Broadcast sending
@@ -458,44 +447,6 @@ impl Blocklist for NoBlocklist {
     }
 }
 
-#[cfg_attr(
-    docsrs,
-    doc(cfg(feature = "shield", doc = "only if `shield` feature-flag is enabled"))
-)]
-#[cfg(feature = "shield")]
-///
-/// Yellowstone Shield blocklist implementation, enabled with `shield` feature-flag.
-///
-pub struct ShieldBlockList<'a> {
-    ///
-    /// Reference to the [`yellowstone_shield_store::PolicyStore`].
-    ///
-    pub policy_store: &'a yellowstone_shield_store::PolicyStore,
-    ///
-    /// List of shield policies to check against.
-    ///
-    pub shield_policy_addresses: &'a [Pubkey],
-    ///
-    /// Default return value when [`yellowstone_shield_store::PolicyStore`] lookup fails.
-    /// recommended to be `true` to allow sending when in doubt.
-    ///
-    pub default_return_value: bool,
-}
-
-#[cfg_attr(docsrs, doc(cfg(feature = "shield")))]
-#[cfg(feature = "shield")]
-impl Blocklist for ShieldBlockList<'_> {
-    fn is_blocked(&self, peer_address: &Pubkey) -> bool {
-        use yellowstone_shield_store::PolicyStoreTrait;
-
-        !self
-            .policy_store
-            .snapshot()
-            .is_allowed(self.shield_policy_addresses, peer_address)
-            .unwrap_or(self.default_return_value)
-    }
-}
-
 impl YellowstoneTpuSender {
     ///
     /// Returns the latest slot observed by the internal Yellowstone slot tracker.
@@ -529,7 +480,7 @@ impl YellowstoneTpuSender {
                 Err(_) => return Err(SendErrorKind::ManagedLeaderScheduleDisconnected),
             }
 
-            leader_slot = leader_slot.saturating_add(NUM_CONSECUTIVE_LEADER_SLOTS);
+            leader_slot = leader_slot.saturating_add(NUM_CONSECUTIVE_LEADER_SLOTS.get() as u64);
         }
 
         Ok(len)
@@ -671,10 +622,10 @@ impl YellowstoneTpuSender {
         let mut seen_addrs = [None; FAST_SEND_MAX_LEADERS];
         let mut seen_addr_count = 0;
 
-        for leader in leaders[..leader_count].iter().copied() {
+        for leader in &leaders[..leader_count] {
             let Some(remote_peer_addr) = self
                 .leader_tpu_info
-                .get_quic_dest_addr(&leader, TpuPortKind::Normal)
+                .get_quic_dest_addr(leader, TpuPortKind::Normal)
             else {
                 missing_addr_count += 1;
                 continue;
@@ -687,7 +638,7 @@ impl YellowstoneTpuSender {
 
             let Some(conn) = self
                 .base_tpu_sender
-                .direct_connection(&leader, remote_peer_addr)
+                .direct_connection(leader, remote_peer_addr)
             else {
                 missing_connection_count += 1;
                 continue;
@@ -831,16 +782,16 @@ impl YellowstoneTpuSender {
         let mut leaders = Vec::new();
         let mut blocked_count = 0;
 
-        for leader_slot in (current_slot..current_slot + fanout_slots)
-            .step_by(NUM_CONSECUTIVE_LEADER_SLOTS as usize)
+        for leader_slot in
+            (current_slot..current_slot + fanout_slots).step_by(NUM_CONSECUTIVE_LEADER_SLOTS.get())
         {
             match self.leader_schedule.get_leader(leader_slot) {
                 Ok(Some(leader)) => {
-                    if let Some(blocklist) = blocklist {
-                        if blocklist.is_blocked(&leader) {
-                            blocked_count += 1;
-                            continue;
-                        }
+                    if let Some(blocklist) = blocklist
+                        && blocklist.is_blocked(&leader)
+                    {
+                        blocked_count += 1;
+                        continue;
                     }
                     if visited.insert(leader) {
                         leaders.push(leader);
@@ -1115,35 +1066,6 @@ impl YellowstoneTpuSender {
             .await
     }
 
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(feature = "shield", doc = "only if `shield` feature-flag is enabled"))
-    )]
-    #[cfg(feature = "shield")]
-    ///
-    /// Sends a transaction to the TPU of the current leader, while applying Yellowstone Shield blocklist policies.
-    ///
-    /// # Arguments
-    ///
-    /// * `sig` - The [`Signature`] identifying the transaction.
-    /// * `txn` - The bincoded transaction slice to send.
-    /// * `shield` - The shield blocklist policies to apply, see [`ShieldBlockList`].
-    ///
-    ///  # Returns
-    ///  `Ok(())` if the transaction was sent successfully, or a `SendError` if there was an error.
-    pub async fn send_txn_with_shield_policies<T>(
-        &mut self,
-        sig: Signature,
-        txn: T,
-        shield: ShieldBlockList<'_>,
-    ) -> Result<(), SendError>
-    where
-        T: AsRef<[u8]> + Send + 'static,
-    {
-        self.send_txn_fanout_with_blocklist(sig, txn, Some(shield))
-            .await
-    }
-
     ///
     /// Updates the identity keypair used by the TPU sender.
     ///
@@ -1193,7 +1115,7 @@ pub async fn create_yellowstone_tpu_sender_with_clients<CB>(
     config: YellowstoneTpuSenderConfig,
     initial_identity: Keypair,
     rpc_client: Arc<rpc_client::RpcClient>,
-    grpc_client: GeyserGrpcClient<impl yellowstone_grpc_client::Interceptor + Clone + 'static>,
+    grpc_client: GeyserGrpcClient,
     callback: Option<CB>,
 ) -> Result<NewYellowstoneTpuSender, CreateTpuSenderError>
 where
@@ -1205,9 +1127,7 @@ where
     tracing::debug!("spawned tpu info service");
 
     let (managed_leader_schedule, managed_leader_schedule_jh) =
-        spawn_managed_leader_schedule(Arc::clone(&rpc_client), config.schedule)
-            .await
-            .expect("spawn_managed_leader_schedule");
+        spawn_managed_leader_schedule(Arc::clone(&rpc_client), config.schedule).await?;
 
     tracing::debug!("spawned managed leader schedule");
 
@@ -1330,6 +1250,16 @@ where
         .expect("x-token")
         .tls_config(ClientTlsConfig::default().with_enabled_roots())
         .expect("tls_config")
+        // Slot tracking used to be a single-use subscribe stream: one
+        // transient EOF permanently poisoned AtomicSlotTracker and the next
+        // transaction failed with SlotTrackerDisconnected.  Retry briefly in
+        // the stream itself; if the outage lasts longer, the dependency task
+        // exits and the caller rebuilds the complete sender instead of using a
+        // stale slot indefinitely.
+        .set_reconnect_config(ReconnectConfig {
+            backoff: Backoff::new(Duration::from_millis(25), 2.0, 4),
+            policy: ReconnectionPolicy::SkipMissedData,
+        })
         .connect()
         .await
         .expect("connect");
@@ -1358,9 +1288,25 @@ async fn yellowstone_tpu_deps_overseer(
     handle_name_vec: Vec<&'static str>,
     handles: Vec<tokio::task::JoinHandle<()>>,
 ) {
-    // Wait for the first task to finish
+    struct AbortOnDrop {
+        handles: Vec<tokio::task::JoinHandle<()>>,
+    }
 
-    let (finished_handle, i, rest) = futures::future::select_all(handles).await;
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            for handle in &self.handles {
+                handle.abort();
+            }
+        }
+    }
+
+    // Wait for the first task to finish
+    let mut guard = AbortOnDrop { handles };
+
+    // Keep the JoinHandles owned by the drop guard while waiting. Moving them
+    // into `select_all` would detach the child tasks if this overseer is
+    // aborted, leaving their gRPC streams alive across sender reconnects.
+    let (finished_handle, i, rest) = futures::future::select_all(guard.handles.iter_mut()).await;
     if finished_handle.is_err() {
         tracing::error!(
             "Yellowstone TPU sender dependency task '{}' has failed with {finished_handle:?}",

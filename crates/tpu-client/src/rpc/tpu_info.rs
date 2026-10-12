@@ -331,6 +331,7 @@ mod tests {
             serve_repair: None,
             pubsub: None,
             version: None,
+            client_id: None,
             feature_set: None,
             shred_version: None,
         };
@@ -348,6 +349,7 @@ mod tests {
             serve_repair: None,
             pubsub: None,
             version: None,
+            client_id: None,
             feature_set: None,
             shred_version: None,
         };
